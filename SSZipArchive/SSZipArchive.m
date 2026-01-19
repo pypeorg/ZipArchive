@@ -917,72 +917,84 @@ BOOL _fileIsSymbolicLink(const unz_file_info *fileInfo);
                          version_made_by:(uint16_t)version_made_by
                     general_purpose_flag:(uint16_t)flag
                                     size:(uint16_t)size_filename {
-    
-    // Respect Language encoding flag only reading filename as UTF-8 when this is set
-    // when file entry created on dos system.
-    //
+
     // https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT
-    //   Bit 11: Language encoding flag (EFS).  If this bit is set,
-    //           the filename and comment fields for this file
-    //           MUST be encoded using UTF-8. (see APPENDIX D)
+    // Bit 11: Language encoding flag (EFS). If set, filename/comment are UTF-8.
     uint16_t made_by = version_made_by >> 8;
-    BOOL made_on_dos = made_by == 0;
+    BOOL made_on_dos = (made_by == 0);
     BOOL languageEncoding = (flag & (1 << 11)) != 0;
-    if (!languageEncoding && made_on_dos) {
-        // APPNOTE.TXT D.1:
-        //   D.2 If general purpose bit 11 is unset, the file name and comment should conform
-        //   to the original ZIP character encoding.  If general purpose bit 11 is set, the
-        //   filename and comment must support The Unicode Standard, Version 4.1.0 or
-        //   greater using the character encoding form defined by the UTF-8 storage
-        //   specification.  The Unicode Standard is published by the The Unicode
-        //   Consortium (www.unicode.org).  UTF-8 encoded data stored within ZIP files
-        //   is expected to not include a byte order mark (BOM).
-        
-        //  Code Page 437 corresponds to kCFStringEncodingDOSLatinUS
-        NSStringEncoding encoding = CFStringConvertEncodingToNSStringEncoding(kCFStringEncodingDOSLatinUS);
-        NSString* strPath = [NSString stringWithCString:filename encoding:encoding];
-        if (strPath) {
-            return strPath;
+
+    // 1) If EFS is set, treat as UTF-8 (most correct per spec)
+    if (languageEncoding) {
+        NSString *utf8 = [NSString stringWithUTF8String:filename];
+        if (utf8) {
+            return utf8;
         }
     }
-    
-    // attempting unicode encoding
-    NSString * strPath = @(filename);
-    if (strPath) {
-        return strPath;
+
+    // 2) If EFS is NOT set: In the real world, Japanese Windows ZIP often uses CP932/Shift-JIS.
+    // Try CP932 first to avoid mojibake for Japanese.
+    // NOTE: kCFStringEncodingDOSJapanese tends to work well for CP932-ish filenames.
+    NSStringEncoding cp932 = CFStringConvertEncodingToNSStringEncoding(kCFStringEncodingDOSJapanese);
+    NSString *sjis = [NSString stringWithCString:filename encoding:cp932];
+    if (sjis) {
+        return sjis;
     }
-    
-    // if filename is non-unicode, detect and transform Encoding
-    NSData *data = [NSData dataWithBytes:(const void *)filename length:sizeof(unsigned char) * size_filename];
-// Testing availability of @available (https://stackoverflow.com/a/46927445/1033581)
+
+    // 3) If created on DOS and not EFS: spec-default is CP437 (DOS Latin US)
+    if (made_on_dos) {
+        NSStringEncoding cp437 = CFStringConvertEncodingToNSStringEncoding(kCFStringEncodingDOSLatinUS);
+        NSString *dosLatin = [NSString stringWithCString:filename encoding:cp437];
+        if (dosLatin) {
+            return dosLatin;
+        }
+    }
+
+    // 4) Try "as-is" (may succeed for UTF-8 even without EFS, or ASCII-only)
+    // Use explicit UTF-8 attempt here (do NOT use @(filename) which assumes UTF-8 and returns too early).
+    NSString *utf8Fallback = [NSString stringWithUTF8String:filename];
+    if (utf8Fallback) {
+        return utf8Fallback;
+    }
+
+    // 5) Attempt auto-detect using Foundation (may help for some cases)
+    NSData *data = [NSData dataWithBytes:(const void *)filename
+                                  length:sizeof(unsigned char) * size_filename];
+
+    NSString *strPath = nil;
 #if __clang_major__ < 9
-    // Xcode 8-
     if (floor(NSFoundationVersionNumber) > NSFoundationVersionNumber10_9_2) {
 #else
-    // Xcode 9+
     if (@available(macOS 10.10, iOS 8.0, watchOS 2.0, tvOS 9.0, *)) {
 #endif
-        // supported encodings are in [NSString availableStringEncodings]
-        [NSString stringEncodingForData:data encodingOptions:nil convertedString:&strPath usedLossyConversion:nil];
+        [NSString stringEncodingForData:data
+                        encodingOptions:nil
+                        convertedString:&strPath
+                    usedLossyConversion:nil];
     } else {
-        // fallback to a simple manual detect for macOS 10.9 or older
-        NSArray<NSNumber *> *encodings = @[@(kCFStringEncodingGB_18030_2000), @(kCFStringEncodingShiftJIS)];
-        for (NSNumber *encoding in encodings) {
-            strPath = [NSString stringWithCString:filename encoding:(NSStringEncoding)CFStringConvertEncodingToNSStringEncoding(encoding.unsignedIntValue)];
+        // fallback manual attempts (add CP932 & Shift-JIS here too)
+        NSArray<NSNumber *> *encodings = @[
+            @(kCFStringEncodingDOSJapanese),
+            @(kCFStringEncodingShiftJIS),
+            @(kCFStringEncodingGB_18030_2000)
+        ];
+        for (NSNumber *enc in encodings) {
+            NSStringEncoding e = CFStringConvertEncodingToNSStringEncoding(enc.unsignedIntValue);
+            strPath = [NSString stringWithCString:filename encoding:e];
             if (strPath) {
                 break;
             }
         }
     }
+
     if (strPath) {
         return strPath;
     }
-    
-    // if filename encoding is non-detected, we default to something based on data
-    // _hexString is more readable than _base64RFC4648 for debugging unknown encodings
-    strPath = [data _hexString];
-    return strPath;
+
+    // 6) Last resort: return hex string (debuggable)
+    return [data _hexString];
 }
+
 
 + (void)zipInfo:(zip_fileinfo *)zipInfo setAttributesOfItemAtPath:(NSString *)path
 {
